@@ -35,12 +35,18 @@ var SwitchSecurityPolicy = `
 
 #define PRINT_MAC(x) (bpf_htonll(x)>>16)
 
+// forwarding table value
+struct fwd_value {
+  u32 ifc;
+  u64 timestamp;
+};
+
 /*
   Fowarding Table: MAC Address to port association.  This table is filled
   in the learning phase and then is used in the forwarding phase to decide
   where to send a packet
 */
-BPF_TABLE("hash", __be64, u32, fwdtable, 1024);
+BPF_TABLE("hash", __be64, struct fwd_value, fwdtable, 1024);
 
 /*
   The Security Mac Table (securitymac) associate to each port the allowed mac
@@ -118,25 +124,32 @@ static int handle_rx(void *skb, struct metadata *md) {
   //LEARNING PHASE: mapping in_ifc with src_interface
   __be64 src_key = eth->src;
 
-  //lookup in fwdtable. if no key present initialize with interface
-  u32 *interface_lookup = fwdtable.lookup_or_init(&src_key, &in_ifc);
+  // //lookup in fwdtable. if no key present initialize with interface
+  struct fwd_value fwd_value_init = {};
+  fwd_value_init.ifc = in_ifc;
+  fwd_value_init.timestamp = bpf_ktime_get_ns();
+
+  struct fwd_value *fwd_value_lookup = fwdtable.lookup_or_init(&src_key, &fwd_value_init);
 
   //if the same mac has changed interface, update it
-  if (*interface_lookup != in_ifc)
-    *interface_lookup = in_ifc;
+  if(fwd_value_lookup){
+      fwd_value_lookup->ifc = in_ifc;
+      fwd_value_lookup->timestamp = bpf_ktime_get_ns();
+  }
 
   //FORWARDING PHASE: select interface(s) to send the packet
   __be64 dst_mac = eth->dst;
 
   //lookup in forwarding table fwdtable
-  u32 *dst_interface = fwdtable.lookup(&dst_mac);
+  fwd_value_lookup = fwdtable.lookup(&dst_mac);
 
-  if (dst_interface) {
+  if (fwd_value_lookup) {
     //HIT in forwarding table
     //redirect packet to dst_interface
+    u32 dst_interface = fwd_value_lookup->ifc;
 
     #ifdef MAC_SECURITY_EGRESS
-    u32 out_iface = *dst_interface;
+    u32 out_iface = dst_interface;
     __be64 *mac_lookup = securitymac.lookup(&out_iface);
     if (mac_lookup)
       if (eth->dst != *mac_lookup){
@@ -149,13 +162,13 @@ static int handle_rx(void *skb, struct metadata *md) {
     #endif
 
     /* do not send packet back on the ingress interface */
-    if (*dst_interface == in_ifc)
+    if (dst_interface == in_ifc)
       return RX_DROP;
 
-    pkt_redirect(skb, md, *dst_interface);
+    pkt_redirect(skb, md, dst_interface);
 
     #ifdef BPF_TRACE
-      bpf_trace_printk("[switch-%d]: redirect out_ifc=%d\n", md->module_id, *dst_interface);
+      bpf_trace_printk("[switch-%d]: redirect out_ifc=%d\n", md->module_id, dst_interface);
     #endif
 
     return RX_REDIRECT;
@@ -167,5 +180,6 @@ static int handle_rx(void *skb, struct metadata *md) {
     pkt_controller(skb, md, PKT_BROADCAST);
     return RX_CONTROLLER;
   }
+  return RX_DROP;
 }
 `
